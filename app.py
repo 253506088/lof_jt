@@ -513,6 +513,7 @@ def main():
         <div style='text-align: center; color: gray;'>
             <p>⚠️ 风险提示：套利有风险，投资需谨慎。本系统仅供参考，不构成投资建议。</p>
             <p>📊 数据更新时间：{}</p>
+            <p>🔗 <a href="https://github.com/253506088/lof_jt" target="_blank">GitHub</a></p>
         </div>
         """.format(datetime.now().strftime('%Y-%m-%d %H:%M:%S')),
         unsafe_allow_html=True
