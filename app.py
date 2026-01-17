@@ -240,22 +240,28 @@ def get_lof_data():
         # 添加辅助字段
         df['实时估值'] = df['基金净值']
         
-        # 数据清洗
-        before_clean = len(df)
-        df = df.dropna(subset=['场内价格', '基金净值', '场内成交额'])
-        df = df[df['场内价格'] > 0]
-        df = df[df['基金净值'] > 0]
-        after_clean = len(df)
+        # 标记无效数据（而不是删除）
+        df['数据状态'] = '正常'
+        invalid_mask = (
+            df['场内价格'].isna() | 
+            df['基金净值'].isna() | 
+            df['场内成交额'].isna() |
+            (df['场内价格'] <= 0) |
+            (df['基金净值'] <= 0)
+        )
+        df.loc[invalid_mask, '数据状态'] = '数据无效'
         
-        if before_clean > after_clean:
-            logger.warning(f"⚠️ 清理无效数据: {before_clean - after_clean} 条")
+        invalid_count = invalid_mask.sum()
+        if invalid_count > 0:
+            logger.warning(f"⚠️ 发现无效数据: {invalid_count} 条（已标记，保留在全量表中）")
         
-        result_df = df[['基金代码', '基金名称', '场内价格', '基金净值', '实时估值', '场内成交额']]
+        result_df = df[['基金代码', '基金名称', '场内价格', '基金净值', '实时估值', '场内成交额', '数据状态']]
         
-        logger.info(f"✅ 数据处理完成，最终返回 {len(result_df)} 条有效数据")
+        valid_count = len(df) - invalid_count
+        logger.info(f"✅ 数据处理完成，共 {len(result_df)} 条数据（有效: {valid_count}，无效: {invalid_count}）")
         logger.info(f"\n📊 最终数据前 5 条:\n{result_df.head().to_string()}")
         
-        st.success(f"✅ 成功获取 {len(result_df)} 只 LOF 基金数据（真实净值）")
+        st.success(f"✅ 成功获取 {len(result_df)} 只 LOF 基金数据（有效: {valid_count}，无效: {invalid_count}）")
         
         return result_df
         
@@ -275,8 +281,9 @@ def calculate_premium_rate(df):
 
 def filter_opportunities(df, min_premium, min_turnover):
     """筛选套利机会"""
-    # 过滤条件（移除申购状态条件，因为是模拟数据）
+    # 过滤条件（排除无效数据）
     filtered = df[
+        (df['数据状态'] == '正常') &
         (df['溢价率(%)'] > min_premium) &
         (df['场内成交额'] > min_turnover)
     ].copy()
@@ -287,6 +294,29 @@ def filter_opportunities(df, min_premium, min_turnover):
 def highlight_premium_level(row):
     """根据溢价率高亮显示"""
     premium = row['溢价率(%)']
+    
+    if premium >= 5.0:
+        # 高溢价：红色高亮（鸡腿机会）
+        return ['background-color: #ffcccc; font-weight: bold; color: #d32f2f'] * len(row)
+    elif premium >= 2.0:
+        # 中等溢价：黄色高亮
+        return ['background-color: #fff9c4; font-weight: bold; color: #f57c00'] * len(row)
+    else:
+        return [''] * len(row)
+
+
+def highlight_with_invalid(row):
+    """根据溢价率和数据状态高亮显示（用于全量表）"""
+    # 检查是否为无效数据
+    if '数据状态' in row.index and row['数据状态'] == '数据无效':
+        # 无效数据：灰色背景
+        return ['background-color: #e0e0e0; color: #757575; font-style: italic'] * len(row)
+    
+    premium = row['溢价率(%)']
+    
+    # 处理 NaN 的情况
+    if pd.isna(premium):
+        return ['background-color: #e0e0e0; color: #757575; font-style: italic'] * len(row)
     
     if premium >= 5.0:
         # 高溢价：红色高亮（鸡腿机会）
@@ -472,16 +502,20 @@ def main():
             st.info("💡 提示：尝试降低溢价率或成交额阈值")
     
     with tab2:
+        # 统计无效数据数量
+        invalid_count = len(df[df['数据状态'] == '数据无效'])
+        valid_count = len(df) - invalid_count
+        
         # 显示全量数据
-        st.markdown(f"**全量数据** - 共 {len(df)} 只 LOF 基金")
-        st.info("💡 此列表显示所有已获取净值的 LOF 基金，按溢价率降序排列")
-        st.markdown("🟥 **红色** = 高溢价(≥55%) | 🟡 **黄色** = 中等溢价(2-5%)")
+        st.markdown(f"**全量数据** - 共 {len(df)} 只 LOF 基金（有效: {valid_count}，无效: {invalid_count}）")
+        st.info("💡 此列表显示所有 LOF 基金，包括数据不完整的基金（灰色标记）")
+        st.markdown("🟥 **红色** = 高溢价(≥5%) | 🟡 **黄色** = 中等溢价(2-5%) | ⬜ **灰色** = 数据无效（停牌/缺失）")
         
-        # 对全量数据也按溢价率排序
-        df_sorted = df.sort_values('溢价率(%)', ascending=False)
+        # 对全量数据按溢价率排序（无效数据排在最后）
+        df_sorted = df.sort_values(['数据状态', '溢价率(%)'], ascending=[True, False])
         
-        # 应用高亮
-        styled_all_df = df_sorted.style.apply(highlight_premium_level, axis=1)
+        # 应用高亮（使用支持无效数据标记的函数）
+        styled_all_df = df_sorted.style.apply(highlight_with_invalid, axis=1)
         
         # 格式化显示
         format_dict_all = {'场内成交额': format_turnover, profit_col_name: "￥{:.2f}"}
