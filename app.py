@@ -13,6 +13,8 @@ import logging
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+from http.client import RemoteDisconnected
 warnings.filterwarnings('ignore')
 
 # 配置日志
@@ -26,11 +28,176 @@ logger = logging.getLogger(__name__)
 # 尝试导入 akshare
 try:
     import akshare as ak
+    import requests
     AKSHARE_AVAILABLE = True
     logger.info("✅ Akshare 模块加载成功")
 except ImportError:
     AKSHARE_AVAILABLE = False
     logger.error("❌ Akshare 未安装")
+
+
+def classify_connection_error(exception):
+    """
+    分析连接错误的类型，返回错误分类和建议
+    
+    返回值:
+        tuple: (错误类型, 错误描述, 是否可重试)
+        错误类型: 'STALE_CONNECTION' | 'RATE_LIMIT' | 'NETWORK_ERROR' | 'UNKNOWN'
+    """
+    error_str = str(exception).lower()
+    exception_type = type(exception).__name__
+    
+    # 情况2: 连接池过期 (Stale Connection)
+    # 特征: RemoteDisconnected, ConnectionResetError, 或 "connection aborted"
+    if 'remotedisconnected' in error_str or 'remote end closed' in error_str:
+        return (
+            'STALE_CONNECTION',
+            '连接池中的连接已过期（服务端主动关闭了空闲连接）',
+            True
+        )
+    if 'connectionreset' in exception_type.lower() or 'connection reset' in error_str:
+        return (
+            'STALE_CONNECTION', 
+            '连接被重置（可能是连接池中的旧连接失效）',
+            True
+        )
+    if 'connection aborted' in error_str:
+        return (
+            'STALE_CONNECTION',
+            '连接中断（连接池连接失效或服务端断开）',
+            True
+        )
+    
+    # 情况1: 服务端限流/反爬
+    # 特征: 429 状态码, "too many requests", "rate limit", 超时
+    if '429' in error_str or 'too many' in error_str or 'rate limit' in error_str:
+        return (
+            'RATE_LIMIT',
+            '请求频率过高，服务端限流（建议增加请求间隔）',
+            True
+        )
+    if 'timeout' in error_str or 'timed out' in error_str:
+        return (
+            'RATE_LIMIT',
+            '请求超时（可能是服务端繁忙或限流）',
+            True
+        )
+    if 'forbidden' in error_str or '403' in error_str:
+        return (
+            'RATE_LIMIT',
+            '访问被拒绝（可能触发了反爬机制）',
+            False  # 403 通常不可重试
+        )
+    
+    # 其他网络错误
+    if 'connection' in error_str or 'network' in error_str:
+        return (
+            'NETWORK_ERROR',
+            f'网络连接错误: {exception_type}',
+            True
+        )
+    
+    return ('UNKNOWN', f'未知错误: {exception_type} - {str(exception)[:100]}', True)
+
+
+def clear_requests_session():
+    """
+    清理 requests 的连接池，解决连接池干涸问题
+    
+    akshare 内部使用 requests.Session，当连接长时间空闲后可能会失效。
+    通过关闭所有适配器的连接池，强制下次请求创建新连接。
+    """
+    try:
+        # 尝试获取 akshare 内部使用的 session 并清理
+        # akshare 的 request 模块通常会创建全局 session
+        import importlib
+        
+        # 重新加载 akshare 的 request 模块，刷新其内部 session
+        if hasattr(ak, 'utils') and hasattr(ak.utils, 'request'):
+            importlib.reload(ak.utils.request)
+            logger.info("🔄 已重新加载 akshare.utils.request 模块")
+        
+        # 额外尝试: 关闭 urllib3 的连接池
+        import urllib3
+        urllib3.disable_warnings()
+        
+        logger.info("🔄 已清理 HTTP 连接池")
+        return True
+    except Exception as e:
+        logger.warning(f"⚠️ 清理连接池时出错（不影响重试）: {str(e)}")
+        return False
+
+
+def call_akshare_with_retry(func, *args, max_retries=3, base_delay=2, **kwargs):
+    """
+    带重试和连接池刷新的 akshare API 调用包装器
+    
+    Args:
+        func: 要调用的 akshare 函数
+        *args: 函数参数
+        max_retries: 最大重试次数
+        base_delay: 基础延迟秒数（指数退避）
+        **kwargs: 函数关键字参数
+    
+    Returns:
+        API 调用结果
+    
+    Raises:
+        最后一次失败的异常
+    """
+    last_exception = None
+    func_name = getattr(func, '__name__', str(func))
+    
+    for attempt in range(max_retries + 1):
+        try:
+            if attempt > 0:
+                logger.info(f"🔄 第 {attempt} 次重试调用 {func_name}...")
+            
+            result = func(*args, **kwargs)
+            
+            if attempt > 0:
+                logger.info(f"✅ 重试成功！{func_name} 在第 {attempt} 次重试后成功")
+            
+            return result
+            
+        except Exception as e:
+            last_exception = e
+            error_type, error_desc, can_retry = classify_connection_error(e)
+            
+            # 记录详细的错误日志
+            logger.error(f"❌ [{func_name}] 调用失败 (尝试 {attempt + 1}/{max_retries + 1})")
+            logger.error(f"   📋 错误分类: {error_type}")
+            logger.error(f"   📝 错误描述: {error_desc}")
+            logger.error(f"   🔍 原始异常: {type(e).__name__}: {str(e)[:200]}")
+            
+            # 判断是否继续重试
+            if attempt >= max_retries:
+                logger.error(f"❌ 已达到最大重试次数 ({max_retries})，放弃重试")
+                break
+            
+            if not can_retry:
+                logger.error(f"❌ 该错误类型不可重试，放弃")
+                break
+            
+            # 计算延迟时间（指数退避）
+            delay = base_delay * (2 ** attempt)
+            
+            # 如果是连接池过期问题，清理连接池
+            if error_type == 'STALE_CONNECTION':
+                logger.info(f"🧹 检测到连接池过期，正在清理旧连接...")
+                clear_requests_session()
+                # 连接池问题通常不需要太长等待
+                delay = min(delay, 3)
+            elif error_type == 'RATE_LIMIT':
+                # 限流问题需要更长的等待时间
+                delay = max(delay, 5)
+                logger.info(f"⏳ 检测到限流，将等待更长时间...")
+            
+            logger.info(f"⏳ 等待 {delay} 秒后重试...")
+            time.sleep(delay)
+    
+    # 所有重试都失败了
+    raise last_exception
 
 # 缓存配置
 CACHE_DIR = os.path.join(os.getcwd(), "lof_cache")
@@ -77,10 +244,14 @@ def save_nav_cache(cache_date, nav_dict):
 def fetch_single_nav(fund_code, start_date, end_date):
     """查询单只基金的净值（用于多线程）"""
     try:
-        df_nav = ak.fund_etf_fund_info_em(
+        # 使用带重试的包装器调用 API（多线程场景下减少重试次数和延迟）
+        df_nav = call_akshare_with_retry(
+            ak.fund_etf_fund_info_em,
             fund=fund_code,
             start_date=start_date,
-            end_date=end_date
+            end_date=end_date,
+            max_retries=2,  # 多线程场景下减少重试次数
+            base_delay=1
         )
         
         if df_nav is not None and len(df_nav) > 0:
@@ -108,7 +279,7 @@ def get_lof_data():
         # ========== 步骤 1：获取LOF场内行情列表 ==========
         logger.info("🔍 [步骤1/3] 开始调用 Akshare API: fund_lof_spot_em() - 获取 LOF 场内行情")
         
-        df_market = ak.fund_lof_spot_em()
+        df_market = call_akshare_with_retry(ak.fund_lof_spot_em, max_retries=3, base_delay=2)
         
         logger.info(f"📊 场内行情数据行数: {len(df_market)}")
         logger.info(f"📋 场内行情列名: {df_market.columns.tolist()}")
